@@ -8,13 +8,60 @@ from functools import partial
 from typing import Optional, Tuple, Union
 
 import torch
-from mamba_ssm.modules.mamba_simple import Mamba
 try:
     from mamba_ssm.modules.mamba_simple import Block  # Legacy mambav1 file structure
 except ImportError:
     from mamba_ssm.modules.block import Block  # mambav2 file structure
 from torch import nn
 from torch.nn import functional as F
+
+# Lazy-import mixers; v2/v3 may be unavailable if deps (e.g. causal_conv1d, cuda-python) missing
+_MAMBA_MIXER_CLS = {}
+_MAMBA_IMPORT_ERRORS = {}
+
+try:
+    from mamba_ssm.modules.mamba_simple import Mamba as MambaV1
+    _MAMBA_MIXER_CLS["v1"] = MambaV1
+except Exception as exc:
+    _MAMBA_IMPORT_ERRORS["v1"] = exc
+
+try:
+    from mamba_ssm.modules.mamba2 import Mamba2
+    _MAMBA_MIXER_CLS["v2"] = Mamba2
+except Exception as exc:
+    _MAMBA_IMPORT_ERRORS["v2"] = exc
+
+try:
+    from mamba_ssm.modules.mamba3 import Mamba3
+    _MAMBA_MIXER_CLS["v3"] = Mamba3
+except Exception as exc:
+    _MAMBA_IMPORT_ERRORS["v3"] = exc
+
+
+def normalize_mamba_version(mamba_version):
+    version = "v1" if mamba_version is None else str(mamba_version).strip().lower()
+    aliases = {
+        "v1": "v1", "1": "v1", "mamba1": "v1", "mambav1": "v1", "mamba_v1": "v1",
+        "v2": "v2", "2": "v2", "mamba2": "v2", "mambav2": "v2", "mamba_v2": "v2",
+        "v3": "v3", "3": "v3", "mamba3": "v3", "mambav3": "v3", "mamba_v3": "v3",
+    }
+    return aliases.get(version, version)
+
+
+def get_mamba_mixer_cls(mamba_version):
+    normalized = normalize_mamba_version(mamba_version)
+    mixer_cls = _MAMBA_MIXER_CLS.get(normalized)
+    if mixer_cls is None:
+        available = ", ".join(sorted(_MAMBA_MIXER_CLS.keys())) or "none"
+        import_error = _MAMBA_IMPORT_ERRORS.get(normalized)
+        details = f" Original import error: {import_error}" if import_error is not None else ""
+        raise ImportError(
+            f"Requested mamba_version='{normalized}' but it is unavailable. "
+            f"Available mixer versions: {available}.{details}"
+        )
+    return mixer_cls
+
+
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import BaseModelOutputWithNoAttention, MaskedLMOutput, SequenceClassifierOutput
 
@@ -38,6 +85,7 @@ def create_block(
         residual_in_fp32=False,
         fused_add_norm=False,
         layer_idx=None,
+        mamba_version="v1",
         bidirectional=True,
         bidirectional_strategy="add",
         bidirectional_weight_tie=True,
@@ -52,12 +100,14 @@ def create_block(
     if ssm_cfg is None:
         ssm_cfg = {}
     factory_kwargs = {"device": device, "dtype": dtype}
+    mixer_cls = get_mamba_mixer_cls(mamba_version)
     bidirectional_kwargs = {
+        "mixer_cls": mixer_cls,
         "bidirectional": bidirectional,
         "bidirectional_strategy": bidirectional_strategy,
         "bidirectional_weight_tie": bidirectional_weight_tie,
     }
-    mixer_cls = partial(BiMambaWrapper, layer_idx=layer_idx, **ssm_cfg, **bidirectional_kwargs, **factory_kwargs)
+    mixer_cls_partial = partial(BiMambaWrapper, **ssm_cfg, **bidirectional_kwargs, **factory_kwargs)
     norm_cls = partial(
         nn.LayerNorm if not rms_norm else RMSNorm, eps=norm_epsilon, **factory_kwargs
     )
@@ -66,7 +116,7 @@ def create_block(
     if "mlp_cls" in inspect.signature(block_cls.__init__).parameters:
         block = block_cls(
             d_model,
-            mixer_cls,
+            mixer_cls_partial,
             mlp_cls=nn.Identity,
             norm_cls=norm_cls,
             fused_add_norm=fused_add_norm,
@@ -75,7 +125,7 @@ def create_block(
     else:
         block = block_cls(
             d_model,
-            mixer_cls,
+            mixer_cls_partial,
             norm_cls=norm_cls,
             fused_add_norm=fused_add_norm,
             residual_in_fp32=residual_in_fp32,
@@ -85,11 +135,12 @@ def create_block(
 
 
 class BiMambaWrapper(nn.Module):
-    """Thin wrapper around Mamba to support bi-directionality."""
+    """Thin wrapper around Mamba (v1/v2/v3) to support bi-directionality."""
 
     def __init__(
             self,
             d_model: int,
+            mixer_cls,
             bidirectional: bool = True,
             bidirectional_strategy: Optional[str] = "add",
             bidirectional_weight_tie: bool = True,
@@ -102,15 +153,9 @@ class BiMambaWrapper(nn.Module):
             raise NotImplementedError(f"`{bidirectional_strategy}` strategy for bi-directionality is not implemented!")
         self.bidirectional = bidirectional
         self.bidirectional_strategy = bidirectional_strategy
-        self.mamba_fwd = Mamba(
-            d_model=d_model,
-            **mamba_kwargs
-        )
+        self.mamba_fwd = mixer_cls(d_model=d_model, **mamba_kwargs)
         if bidirectional:
-            self.mamba_rev = Mamba(
-                d_model=d_model,
-                **mamba_kwargs
-            )
+            self.mamba_rev = mixer_cls(d_model=d_model, **mamba_kwargs)
             if bidirectional_weight_tie:  # Tie in and out projections (where most of param count lies)
                 self.mamba_rev.in_proj.weight = self.mamba_fwd.in_proj.weight
                 self.mamba_rev.in_proj.bias = self.mamba_fwd.in_proj.bias
@@ -188,6 +233,7 @@ class CaduceusMixerModel(nn.Module):
             if layer_norm_fn is None or rms_norm_fn is None:
                 raise ImportError("Failed to import Triton LayerNorm / RMSNorm kernels")
 
+        mamba_version = getattr(config, "mamba_version", "v1")
         self.layers = nn.ModuleList(
             [
                 create_block(
@@ -198,6 +244,7 @@ class CaduceusMixerModel(nn.Module):
                     residual_in_fp32=config.residual_in_fp32,
                     fused_add_norm=config.fused_add_norm,
                     layer_idx=i,
+                    mamba_version=mamba_version,
                     bidirectional=config.bidirectional,
                     bidirectional_strategy=config.bidirectional_strategy,
                     bidirectional_weight_tie=config.bidirectional_weight_tie,
@@ -431,12 +478,12 @@ class CaduceusForMaskedLM(CaduceusPreTrainedModel):
             raise NotImplementedError("Setting output embeddings for RCPS LM is not supported.")
         self.lm_head = new_embeddings
 
-    def tie_weights(self):
+    def tie_weights(self, **kwargs):
         """Tie weights, accounting for RCPS."""
         if self.config.rcps:
             self.lm_head.set_weight(self.get_input_embeddings().weight)
         else:
-            super().tie_weights()
+            super().tie_weights(**kwargs)
 
     def get_decoder(self):
         """Get decoder (backbone) for the model."""

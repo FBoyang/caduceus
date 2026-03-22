@@ -30,6 +30,7 @@ class CaduceusConfig(PretrainedConfig):
             initializer_cfg: Optional[dict] = None,
 
             # Caduceus-specific params
+            mamba_version: Optional[str] = "v1",  # Mamba mixer: v1, v2, or v3
             bidirectional: bool = True,
             bidirectional_strategy: Union[str, None] = "add",
             bidirectional_weight_tie: bool = True,
@@ -39,6 +40,7 @@ class CaduceusConfig(PretrainedConfig):
     ):
         super().__init__(**kwargs)
         self.d_model = d_model
+        self.mamba_version = mamba_version
         self.n_layer = n_layer
         self.vocab_size = vocab_size
         self.ssm_cfg = ssm_cfg
